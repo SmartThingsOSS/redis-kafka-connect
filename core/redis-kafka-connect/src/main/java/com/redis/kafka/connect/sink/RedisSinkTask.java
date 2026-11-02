@@ -40,6 +40,7 @@ import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.apache.kafka.connect.storage.Converter;
@@ -63,12 +64,27 @@ public class RedisSinkTask extends SinkTask {
 
     private static final ObjectMapper objectMapper = objectMapper();
 
+    private static final String HEXPIRE_PROBE_KEY = "__redis-kafka-connect:hexpire-probe";
+
+    private static final String HEXPIRE_REQUIRED_MESSAGE = "redis.key.ttl with redis.type=HASH_FIELD requires a Redis engine that supports HEXPIRE (hash field expiration)";
+
+    private boolean hashFieldExpireSupported;
+
     private RedisSinkConfig config;
 
     private AbstractRedisClient client;
     private StatefulRedisModulesConnection<String, String> connection;
     private Converter jsonConverter;
     private RedisItemWriter<byte[], byte[], SinkRecord> writer;
+    private ErrantRecordReporter reporter;
+
+    // HASH_FIELD: each record's key, field and value, built once in put() before the write and
+    // read by the write operations. Keyed by identity; cleared after every put().
+    private final Map<SinkRecord, ResolvedHashField> resolved = new IdentityHashMap<>();
+
+    // value is null for a tombstone.
+    private record ResolvedHashField(byte[] key, byte[] field, byte[] value) {
+    }
 
     private static ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();
@@ -96,8 +112,20 @@ public class RedisSinkTask extends SinkTask {
         config = new RedisSinkConfig(props);
         jsonConverter = new JsonConverter();
         jsonConverter.configure(Collections.singletonMap("schemas.enable", "false"), false);
+        try {
+            reporter = context.errantRecordReporter();
+        } catch (NoSuchMethodError | NoClassDefFoundError e) {
+            // Connect runtimes earlier than 2.6 have no errant record reporter.
+            reporter = null;
+        }
         client = config.client();
         connection = RedisModulesUtils.connection(client);
+        if (config.getType() == RedisSinkConfig.RedisType.HASH_FIELD) {
+            hashFieldExpireSupported = probeHashFieldExpire();
+            if (!hashFieldExpireSupported && config.getKeyTTL() > 0) {
+                throw new ConnectException(HEXPIRE_REQUIRED_MESSAGE);
+            }
+        }
         writer = RedisItemWriter.operation(ByteArrayCodec.INSTANCE, new ConditionalDel(operation(), del()));
         writer.setClient(client);
         writer.setMultiExec(config.isMultiExec());
@@ -134,6 +162,8 @@ public class RedisSinkTask extends SinkTask {
             case JSON:
             case STRING:
                 return new Del<>(this::key);
+            case HASH_FIELD:
+                return new Hdel();
             default:
                 return new Noop<>();
         }
@@ -188,6 +218,8 @@ public class RedisSinkTask extends SinkTask {
 
         switch (config.getType()) {
             case HASH -> oper = new Hset<>(this::key, this::map);
+            case HASH_FIELD -> oper = new Hset<>(record -> resolved(record).key(),
+                    record -> Collections.singletonMap(resolved(record).field(), resolved(record).value()));
             case JSON -> oper = new JsonSet<>(this::key, this::jsonValue);
             case STRING -> oper = new Set<>(this::key, this::value);
             case STREAM -> oper = new Xadd<>(this::collectionKey, this::streamMessages);
@@ -211,6 +243,18 @@ public class RedisSinkTask extends SinkTask {
         @Override
         public List<RedisFuture<Object>> execute(RedisAsyncCommands<byte[], byte[]> commands, Chunk<? extends SinkRecord> items) {
             List<RedisFuture<Object>> futures = new ArrayList<>(delegate.execute(commands, items));
+            if (config.getType() == RedisSinkConfig.RedisType.HASH_FIELD) {
+                // Expire only this record's field (HEXPIRE). EXPIRE would expire the whole shared hash.
+                for (SinkRecord record : items) {
+                    long ttl = ttl(record);
+                    if (ttl > 0) {
+                        ResolvedHashField entry = resolved(record);
+                        futures.add((RedisFuture<Object>) (RedisFuture<?>) commands.hexpire(entry.key(), ttl,
+                                entry.field()));
+                    }
+                }
+                return futures;
+            }
 
             for (SinkRecord record : items) {
                 byte[] key = determineKey(record);
@@ -232,18 +276,36 @@ public class RedisSinkTask extends SinkTask {
                 default -> key(record);
             };
         }
+    }
 
-        private long extractTTLFromHeaders(SinkRecord record) {
-            for (Header header : record.headers()) {
-                if (header.key().equals(RedisSinkConfigDef.KEY_TTL_CONFIG)) {
-                    try {
-                        return Long.parseLong(header.value().toString());
-                    } catch (NumberFormatException e) {
-                        log.warn("Invalid TTL header value for record {}: {}", record, header.value());
-                    }
+    // The record's TTL in seconds: the header TTL if set and positive, otherwise redis.key.ttl. Zero or less means none.
+    private long ttl(SinkRecord record) {
+        long ttlFromRecord = extractTTLFromHeaders(record);
+        return ttlFromRecord > 0 ? ttlFromRecord : config.getKeyTTL();
+    }
+
+    private long extractTTLFromHeaders(SinkRecord record) {
+        for (Header header : record.headers()) {
+            if (header.key().equals(RedisSinkConfigDef.KEY_TTL_CONFIG)) {
+                try {
+                    return Long.parseLong(header.value().toString());
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid TTL header value for record {}: {}", record, header.value());
                 }
             }
-            return -1L;
+        }
+        return -1L;
+    }
+
+    // Probes whether the server supports hash field expiration. HEXPIRE on a missing key is a no-op where
+    // supported; older engines (e.g. Redis < 7.4, Valkey < 9.0) reject the command.
+    private boolean probeHashFieldExpire() {
+        try {
+            connection.sync().hexpire(HEXPIRE_PROBE_KEY, 1, "x");
+            return true;
+        } catch (RedisCommandExecutionException e) {
+            log.info("Redis engine does not support HEXPIRE (hash field expiration): {}", e.getMessage());
+            return false;
         }
     }
 
@@ -301,6 +363,31 @@ public class RedisSinkTask extends SinkTask {
         String keyspace = keyspace(sinkRecord);
         String key = keyspace + config.getSeparator() + String.valueOf(sinkRecord.key());
         return key.getBytes(config.getCharset());
+    }
+
+    // The hash key: the keyspace and separator (when the keyspace is set) followed by the resolved
+    // redis.hash.key value. Concatenated as bytes so a byte[] key field is not re-encoded.
+    private byte[] hashFieldKey(SinkRecord sinkRecord) {
+        byte[] id = config.getHashKey().resolve(sinkRecord.key(), config.getCharset());
+        if (config.getKeyspace().isEmpty()) {
+            return id;
+        }
+        byte[] prefix = (keyspace(sinkRecord) + config.getSeparator()).getBytes(config.getCharset());
+        byte[] key = Arrays.copyOf(prefix, prefix.length + id.length);
+        System.arraycopy(id, 0, key, prefix.length, id.length);
+        return key;
+    }
+
+    private byte[] hashField(SinkRecord sinkRecord) {
+        return config.getHashField().resolve(sinkRecord.key(), config.getCharset());
+    }
+
+    private ResolvedHashField resolved(SinkRecord sinkRecord) {
+        ResolvedHashField entry = resolved.get(sinkRecord);
+        if (entry == null) {
+            throw new IllegalStateException("HASH_FIELD record was not resolved before the write");
+        }
+        return entry;
     }
 
     private Collection<byte[]> members(SinkRecord sinkRecord) {
@@ -377,16 +464,57 @@ public class RedisSinkTask extends SinkTask {
     @Override
     public void put(final Collection<SinkRecord> records) {
         log.debug("Processing {} records", records.size());
+        List<SinkRecord> writable = new ArrayList<>(records);
+        if (config.getType() == RedisSinkConfig.RedisType.HASH_FIELD) {
+            // Checked before the try block so a bad record fails the task instead of being
+            // retried forever as a RetriableException.
+            writable.removeIf(record -> !resolveOrReport(record));
+        }
         try {
-            writer.write(new Chunk<>(new ArrayList<>(records)));
+            writer.write(new Chunk<>(writable));
         } catch (RedisConnectionException e) {
             throw new RetriableException("Could not get connection to Redis", e);
         } catch (RedisCommandTimeoutException e) {
             throw new RetriableException("Timeout while writing sink records", e);
         } catch (Exception e) {
             throw new RetriableException("Could not write sink records", e);
+        } finally {
+            resolved.clear();
         }
-        log.info("Wrote {} records", records.size());
+        log.info("Wrote {} records", writable.size());
+    }
+
+    // Builds the record's hash key, field and (unless a tombstone) value once and keeps them for the
+    // write. If any can't be built, reports the record as errant and returns false so it is skipped.
+    private boolean resolveOrReport(SinkRecord record) {
+        try {
+            byte[] key = hashFieldKey(record);
+            byte[] field = hashField(record);
+            byte[] value = null;
+            if (record.value() != null) {
+                value = jsonValue(record);
+                if (!hashFieldExpireSupported && extractTTLFromHeaders(record) > 0) {
+                    throw new DataException("A " + RedisSinkConfigDef.KEY_TTL_CONFIG
+                            + " header with redis.type=HASH_FIELD requires a Redis engine that supports HEXPIRE (hash field expiration)");
+                }
+            }
+            resolved.put(record, new ResolvedHashField(key, field, value));
+            return true;
+        } catch (DataException e) {
+            reportErrant(record, e);
+            return false;
+        }
+    }
+
+    // Sends the record to the errant record reporter (DLQ / errors.tolerance). Without a reporter, fails
+    // the task with a non-retriable error, since retrying the same record can never succeed.
+    private void reportErrant(SinkRecord record, DataException cause) {
+        String message = String.format("Could not write record topic=%s partition=%d offset=%d to Redis: %s",
+                record.topic(), record.kafkaPartition(), record.kafkaOffset(), cause.getMessage());
+        if (reporter == null) {
+            throw new ConnectException(message, cause);
+        }
+        reporter.report(record, new DataException(message, cause));
     }
 
     @Override
@@ -460,6 +588,24 @@ public class RedisSinkTask extends SinkTask {
                 boolean isDelete) {
             Operation<byte[], byte[], SinkRecord, Object> operation = isDelete ? del : write;
             return operation.execute(commands, new Chunk<>(run));
+        }
+
+    }
+
+    // Tombstone handling for HASH_FIELD: remove only this record's field from the shared hash.
+    // spring-batch-redis has no HDEL operation. Redis deletes the hash when its last field is removed.
+    private class Hdel implements Operation<byte[], byte[], SinkRecord, Object> {
+
+        @SuppressWarnings("unchecked")
+        @Override
+        public List<RedisFuture<Object>> execute(RedisAsyncCommands<byte[], byte[]> commands,
+                                                 Chunk<? extends SinkRecord> items) {
+            List<RedisFuture<Object>> futures = new ArrayList<>();
+            for (SinkRecord record : items) {
+                ResolvedHashField entry = resolved(record);
+                futures.add((RedisFuture<Object>) (RedisFuture<?>) commands.hdel(entry.key(), entry.field()));
+            }
+            return futures;
         }
 
     }
