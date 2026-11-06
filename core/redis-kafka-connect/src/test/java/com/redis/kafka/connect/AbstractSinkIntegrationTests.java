@@ -26,6 +26,7 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaAndValue;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.AfterEach;
@@ -431,6 +432,16 @@ abstract class AbstractSinkIntegrationTests extends AbstractTestBase {
             assertEquals(expectedSample.getTimestamp(), actualSample.getTimestamp());
             assertEquals(expectedSample.getValue(), actualSample.getValue());
         }
+    }
+
+    // Types other than HASH_FIELD keep their existing behavior: a record that can't be converted is
+    // retried rather than reported.
+    @Test
+    void putConversionErrorIsRetriable() {
+        String topic = "putConversionErrorIsRetriable";
+        List<SinkRecord> records = List.of(write(topic, new SchemaAndValue(Schema.STRING_SCHEMA, "not-a-number"),
+                new SchemaAndValue(Schema.FLOAT64_SCHEMA, 1.0)));
+        Assertions.assertThrows(RetriableException.class, () -> put(topic, RedisType.TIMESERIES, records));
     }
 
     @Test
