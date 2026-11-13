@@ -87,15 +87,20 @@ jobs:
           distribution: temurin
           java-version: '27'
       - uses: gradle/actions/setup-gradle@v6.4.1
+      # The fork carries no tags, so Axion would fall back to 0.1.0. Fetch
+      # upstream's v* release tags locally (never pushed) to version builds.
+      - name: Fetch upstream version tags
+        run: git fetch --no-tags https://github.com/redis-field-engineering/redis-kafka-connect.git 'refs/tags/v*:refs/tags/v*'
       - name: Create Confluent archive
         id: archive
         run: |
           ./gradlew redis-kafka-connect:createConfluentArchive
           zip=$(ls core/redis-kafka-connect/build/confluent/*.zip)
           echo "path=$zip" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$zip" .zip)" >> "$GITHUB_OUTPUT"
+      # archive: false uploads the Confluent zip as-is (no GitHub wrapper zip),
+      # so the download can go straight to Confluent as a custom connector.
       - uses: actions/upload-artifact@v7.0.2
         with:
-          name: ${{ steps.archive.outputs.name }}
           path: ${{ steps.archive.outputs.path }}
+          archive: false
           if-no-files-found: error
