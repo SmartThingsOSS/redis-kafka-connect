@@ -1,7 +1,9 @@
 package com.redis.kafka.connect.common;
 
 import io.lettuce.core.RedisURI;
+import java.util.Map;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigValue;
 
 /** Defines the common Redis connection configuration options. */
 public abstract class RedisConfigDef extends ConfigDef {
@@ -12,6 +14,20 @@ public abstract class RedisConfigDef extends ConfigDef {
 	private static final boolean CLUSTER_DEFAULT = false;
 
 	private static final String CLUSTER_DOC = "Connect to a Redis Cluster database";
+
+	/** Configuration key for {@code redis.cluster.address.remap.enabled}. */
+	public static final String CLUSTER_ADDRESS_REMAP_CONFIG = "redis.cluster.address.remap.enabled";
+
+	private static final boolean CLUSTER_ADDRESS_REMAP_DEFAULT = false;
+
+	private static final String CLUSTER_ADDRESS_REMAP_DOC = "Rewrite the port of every cluster address so all nodes"
+			+ " can be reached through one load balancer (e.g. AWS PrivateLink), each on its own port. Requires"
+			+ " redis.cluster=true and a redis.port that is a multiple of 1000 between 1000 and 64000 (the base port)."
+			+ " redis.host stays the cluster configuration endpoint and is reached on the base port, whatever its name."
+			+ " Node hostnames end in -SSSS-NNN, where SSSS is the shard number (0001...) and NNN the node number"
+			+ " within the shard (001...); port = base + SSSS * 100 + NNN. Example with redis.port=7000:"
+			+ " mycluster-0001-002.<domain> -> 7102, mycluster-0002-001.<domain> -> 7201. At most 9 shards."
+			+ " Hostnames that don't fit the rule fail to connect.";
 
 	/** Configuration key for {@code redis.host}. */
 	public static final String HOST_CONFIG = "redis.host";
@@ -124,6 +140,8 @@ public abstract class RedisConfigDef extends ConfigDef {
 
 	private void defineConfigs() {
 		define(CLUSTER_CONFIG, Type.BOOLEAN, CLUSTER_DEFAULT, Importance.MEDIUM, CLUSTER_DOC);
+		define(CLUSTER_ADDRESS_REMAP_CONFIG, Type.BOOLEAN, CLUSTER_ADDRESS_REMAP_DEFAULT, Importance.LOW,
+				CLUSTER_ADDRESS_REMAP_DOC);
 		define(HOST_CONFIG, Type.STRING, HOST_DEFAULT, Importance.HIGH, HOST_DOC);
 		define(PORT_CONFIG, Type.INT, PORT_DEFAULT, Importance.HIGH, PORT_DOC);
 		define(URI_CONFIG, Type.STRING, URI_DEFAULT, Importance.MEDIUM, URI_DOC);
@@ -137,6 +155,51 @@ public abstract class RedisConfigDef extends ConfigDef {
 		define(KEY_CERT_CONFIG, Type.STRING, KEY_CERT_DEFAULT, Importance.MEDIUM, KEY_CERT_DOC);
 		define(KEY_PASSWORD_CONFIG, Type.PASSWORD, KEY_PASSWORD_DEFAULT, Importance.MEDIUM, KEY_PASSWORD_DOC);
 		define(CACERT_CONFIG, Type.STRING, CACERT_DEFAULT, Importance.MEDIUM, CACERT_DOC);
+	}
+
+	@Override
+	public Map<String, ConfigValue> validateAll(Map<String, String> props) {
+		Map<String, ConfigValue> results = super.validateAll(props);
+		ConfigValue remap = results.get(CLUSTER_ADDRESS_REMAP_CONFIG);
+		if (remap == null || !Boolean.TRUE.equals(remap.value()) || !remap.errorMessages().isEmpty()) {
+			return results;
+		}
+		ConfigValue cluster = results.get(CLUSTER_CONFIG);
+		ConfigValue port = results.get(PORT_CONFIG);
+		if (!cluster.errorMessages().isEmpty() || !port.errorMessages().isEmpty()) {
+			return results;
+		}
+		Integer basePort = basePort(props.get(URI_CONFIG), (Integer) port.value());
+		String error = basePort == null ? null : addressRemapError(Boolean.TRUE.equals(cluster.value()), basePort);
+		if (error != null) {
+			remap.addErrorMessage(error);
+		}
+		return results;
+	}
+
+	/**
+	 * Checks the settings address remapping depends on.
+	 *
+	 * @param cluster value of {@code redis.cluster}
+	 * @param basePort port of the configured endpoint ({@code redis.port}, or the port in {@code redis.uri})
+	 * @return an error message, or {@code null} when remapping can be used
+	 */
+	public static String addressRemapError(boolean cluster, int basePort) {
+		if (!cluster) {
+			return CLUSTER_ADDRESS_REMAP_CONFIG + "=true requires " + CLUSTER_CONFIG + "=true";
+		}
+		return ClusterAddressRemap.basePortError(basePort);
+	}
+
+	private static Integer basePort(String uri, Integer port) {
+		if (uri == null || uri.trim().isEmpty()) {
+			return port;
+		}
+		try {
+			return RedisURI.create(uri.trim()).getPort();
+		} catch (RuntimeException e) {
+			return null; // an invalid URI is reported when the connector parses it
+		}
 	}
 
 }
