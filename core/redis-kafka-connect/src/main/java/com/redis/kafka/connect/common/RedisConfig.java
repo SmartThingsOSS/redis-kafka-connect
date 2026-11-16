@@ -28,6 +28,7 @@ import java.io.File;
 import java.time.Duration;
 import java.util.Map;
 import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.types.Password;
 
 /** Parses common Redis connection, authentication, and TLS settings. */
@@ -43,6 +44,18 @@ public abstract class RedisConfig extends AbstractConfig {
      */
     protected RedisConfig(RedisConfigDef config, Map<?, ?> originals) {
         super(config, originals);
+        if (isAddressRemapEnabled()) {
+            String error = RedisConfigDef.addressRemapError(
+                    Boolean.TRUE.equals(getBoolean(RedisConfigDef.CLUSTER_CONFIG)), uri().getPort());
+            if (error != null) {
+                throw new ConfigException(RedisConfigDef.CLUSTER_ADDRESS_REMAP_CONFIG, true, error);
+            }
+        }
+    }
+
+    /** {@return whether cluster address remapping is enabled} */
+    public boolean isAddressRemapEnabled() {
+        return Boolean.TRUE.equals(getBoolean(RedisConfigDef.CLUSTER_ADDRESS_REMAP_CONFIG));
     }
 
     /** {@return the Redis URI with configured authentication, TLS, and command timeout} */
@@ -88,7 +101,9 @@ public abstract class RedisConfig extends AbstractConfig {
     private AbstractRedisClient client(RedisURI uri) {
         Boolean cluster = getBoolean(RedisConfigDef.CLUSTER_CONFIG);
         if (Boolean.TRUE.equals(cluster)) {
-            RedisClusterClient client = RedisClusterClient.create(uri);
+            RedisClusterClient client = isAddressRemapEnabled()
+                    ? RemappedClusterClient.create(uri, new ClusterAddressRemap(uri.getHost(), uri.getPort()))
+                    : RedisClusterClient.create(uri);
             client.setOptions(clientOptions(ClusterClientOptions.builder().topologyRefreshOptions(
                     ClusterTopologyRefreshOptions.builder().enableAllAdaptiveRefreshTriggers()
                             .enablePeriodicRefresh(Duration.ofSeconds(30)).build())).build());

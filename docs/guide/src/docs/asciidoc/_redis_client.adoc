@@ -34,3 +34,89 @@ redis.username = user1
 redis.password = pass
 ----
 
+== Cluster Address Remapping
+
+Use address remapping when the connector reaches a Redis Cluster through a single load balancer, for example AWS PrivateLink to an AWS MemoryDB or node-based ElastiCache cluster.
+
+A cluster-mode client asks the cluster configuration endpoint for the node list, then connects to each node hostname on the same port (6379).
+A network load balancer routes only by port, so it can't tell those nodes apart.
+Instead, the load balancer gives every node its own port, and the connector rewrites the port for each hostname just before it connects.
+
+[source,properties]
+----
+redis.cluster = true
+redis.cluster.address.remap.enabled = true
+redis.host = clustercfg.mycluster.abc123.memorydb.us-east-2.amazonaws.com
+redis.port = 7000
+redis.tls = true
+----
+
+Requirements, checked when the connector starts and in config validation:
+
+* `redis.cluster=true`.
+* `redis.port` (or the port in `redis.uri`) is the *base port*: a multiple of 1000 between 1000 and 64000, for example 7000.
+
+`redis.host` stays the cluster configuration endpoint, which the connector reaches on the base port.
+Whatever host is configured there is treated as the configuration endpoint, so its name doesn't need to follow any pattern.
+
+=== How a hostname becomes a port
+
+Every node hostname is the cluster name followed by `-SSSS-NNN`. In this hostname, the cluster is `mycluster`, `SSSS` is `0001` and `NNN` is `002`:
+
+----
+mycluster-0001-002.mycluster.abc123.memorydb.us-east-2.amazonaws.com
+----
+
+* `SSSS` is the *shard number*: four digits, zero-padded, starting at `0001`. Nodes with the same `SSSS` hold the same hash slots.
+* `NNN` is the *node number within the shard*: three digits, zero-padded, starting at `001`. A shard has one primary and up to five replicas, so `NNN` runs from `001` to at most `006`. It does not say which node is the primary; that can change on failover.
+
+The rule:
+
+----
+port = redis.port + SSSS × 100 + NNN
+----
+
+The configured `redis.host` uses `redis.port` itself.
+
+Example with `redis.port=7000`, for a cluster of 2 shards with 2 nodes each:
+
+[cols="3,1,1,1",options="header"]
+|===
+| Hostname | SSSS | NNN | Port
+| `clustercfg.<domain>` (the configured `redis.host`) | | | 7000
+| `mycluster-0001-001.<domain>` | 1 | 1 | 7101
+| `mycluster-0001-002.<domain>` | 1 | 2 | 7102
+| `mycluster-0002-001.<domain>` | 2 | 1 | 7201
+| `mycluster-0002-002.<domain>` | 2 | 2 | 7202
+|===
+
+The load balancer must use the same rule and base port: listener 7000 forwards to every node, and listener `base + SSSS × 100 + NNN` forwards to that node's IP on 6379.
+
+=== What stays the same
+
+* Only the port changes. The hostname is kept, so TLS still verifies the certificate against the real node hostname.
+* The client stays in cluster mode: topology discovery, `MOVED`/`ASK` redirects and failover work as usual.
+* With `redis.cluster.address.remap.enabled=false` (the default), connections are unchanged.
+
+=== Limits and errors
+
+* At most 9 shards: the shard number occupies the hundreds digit.
+* A hostname that is neither the configured `redis.host` nor ends in `-SSSS-NNN` fails to connect with an error like:
++
+----
+Address remapping can't map host '10.240.98.224': expected the configured redis.host (clustercfg.mycluster.abc123.memorydb.us-east-2.amazonaws.com) or a node hostname ending in -SSSS-NNN, e.g. mycluster-0001-002.<domain>
+----
+* A shard number above 9 fails with:
++
+----
+Address remapping can't map host 'mycluster-0010-001.<domain>': shard 10 is outside 1-9 (port = base + SSSS * 100 + NNN)
+----
+* Configuration errors:
++
+----
+redis.cluster.address.remap.enabled=true requires redis.cluster=true
+Address remapping requires redis.port to be a multiple of 1000 between 1000 and 64000 (the base port, e.g. 7000), but it is 6379
+----
+
+The rule relies on the cluster announcing node hostnames, as MemoryDB and TLS-enabled ElastiCache do. A cluster that announces IP addresses can't be remapped.
+
